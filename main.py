@@ -8,12 +8,14 @@
 # - Exits: inverse chandelier (Low + k*ATR) break, -25% off peak option, ≤7 DTE
 # - Duplicate protection: no new order if already holding (DB + broker)
 # - Logging/diagnostics: DEBUG=true for verbose
+# - Market-hours gating: skip new buys outside RTH (holiday-aware via Tradier).
 # ==========================================================
 
 import os, json, sqlite3, time, requests, pandas as pd
 from datetime import datetime, timedelta, UTC
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo  # NEW
 
 # --------------- Settings ----------------
 def _b(name, d):
@@ -60,6 +62,11 @@ class S:
     # Orders / persistence
     QTY = _i("ORDER_QTY", 1)
     DB  = os.getenv("DB_PATH", "./puts.db")  # separate DB recommended
+
+    # Trading session guards (NEW)
+    ALLOW_AFTER_HOURS = _b("ALLOW_AFTER_HOURS", False)
+    SKIP_OPEN_MIN     = _i("SKIP_OPEN_MIN", 5)
+    SKIP_CLOSE_MIN    = _i("SKIP_CLOSE_MIN", 10)
 
     # Logging
     VERBOSE = _b("VERBOSE", True)
@@ -114,6 +121,54 @@ def _tradier_post(path, data):
     time.sleep(S.TRADIER_API_DELAY)
     return data
 
+# --------------- Time/session helpers (NEW) ---------------
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    if not ts: return None
+    try:
+        ts = ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+def _et_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        return datetime.now().astimezone()
+
+def market_open_rth() -> bool:
+    try:
+        clk = _tradier_get("/v1/markets/clock") or {}
+        c = clk.get("clock") or clk
+        state = str(c.get("state", "")).lower()
+        if state != "open":
+            return False
+
+        now = _parse_iso(c.get("timestamp")) or datetime.now(UTC)
+        nxt = _parse_iso(c.get("next_change"))
+        if nxt:
+            mins_to_close = (nxt - now).total_seconds() / 60.0
+            if mins_to_close < S.SKIP_CLOSE_MIN:
+                return False
+
+        et = _et_now()
+        start = et.replace(hour=9, minute=30, second=0, microsecond=0)
+        if et < start + timedelta(minutes=S.SKIP_OPEN_MIN):
+            return False
+
+        if et.weekday() >= 5:
+            return False
+        return True
+    except Exception:
+        et = _et_now()
+        if et.weekday() >= 5:
+            return False
+        start = et.replace(hour=9, minute=30, second=0, microsecond=0)
+        end   = et.replace(hour=16, minute=0,  second=0, microsecond=0)
+        if et < start + timedelta(minutes=S.SKIP_OPEN_MIN): return False
+        if et > end - timedelta(minutes=S.SKIP_CLOSE_MIN):  return False
+        return start <= et <= end
+
 # --------------- Indicators ----------------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
@@ -130,11 +185,12 @@ def atr(df, n=14):
     return tr.rolling(n).mean()
 
 def chandelier_bear(low, atrv):  # for puts: stop when price rises above this
-    return low + S.TRAIL_K * atrv
+    return low + S.TRAIL_K * atrv if atrv is not None else low
 
 def bear_ok(df):
     if df.empty or len(df) < max(S.EMA_SLOW+5, S.RSI_LEN+5): return False
     c = df["Close"]; ef, es = ema(c, S.EMA_FAST), ema(c, S.EMA_SLOW); r = rsi(c, S.RSI_LEN)
+    if len(r.dropna()) < 2: return False
     return (ef.iloc[-1] < es.iloc[-1]) and (r.iloc[-1] < 50) and (r.iloc[-1] <= r.iloc[-2])
 
 # --------------- DB ----------------
@@ -146,7 +202,6 @@ def db_init():
         lowest_close REAL, trail_bear REAL, peak_option REAL, created_at TEXT,
         option_type TEXT
     )""")
-    # migrate columns if needed (idempotent)
     for col_sql in [
         "ALTER TABLE picks ADD COLUMN option_type TEXT",
         "ALTER TABLE picks ADD COLUMN lowest_close REAL",
@@ -282,12 +337,12 @@ def tradier_order(underlying: str, occ_symbol: str, side: str, qty: int, otype="
         return {"error":"no account"}
     data = {
         "class":"option",
-        "symbol": underlying,          # underlying stock (e.g., AAPL)
-        "option_symbol": occ_symbol,   # OCC code (e.g., AAPL241220P00190000)
-        "side": side,                  # buy_to_open / sell_to_close
+        "symbol": underlying,
+        "option_symbol": occ_symbol,
+        "side": side,
         "quantity": str(qty),
-        "type": otype,                 # limit / market
-        "duration": S.DURATION,        # day / gtc
+        "type": otype,
+        "duration": S.DURATION,
     }
     if otype=="limit" and price is not None:
         data["price"] = f"{price:.2f}"
@@ -330,7 +385,7 @@ def has_tradier_position(ticker: str, occ: Optional[str]=None) -> bool:
         if occ:
             if sym == occ: return True
         else:
-            if und == ticker or sym.startswith(ticker): return True
+            if und == ticker or sym == ticker or sym.split(' ')[0] == ticker: return True
     return False
 
 def already_holding(ticker: str, occ: str) -> bool:
@@ -352,7 +407,6 @@ def pick_put_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     puts = df[df.get("option_type") == "put"].copy()
     if puts.empty: return None
 
-    # DTE window
     try: exp_dt = datetime.fromisoformat(exp)
     except Exception: exp_dt = datetime.strptime(exp, "%Y-%m-%d")
     dte = max(0, (exp_dt.date() - datetime.now(UTC).date()).days)
@@ -366,7 +420,6 @@ def pick_put_from_chain(t: str, exp: str, today: datetime) -> Optional[Pick]:
     puts["mid"] = (puts["bid"] + puts["ask"]) / 2.0
     puts["spr"] = (puts["ask"] - puts["bid"]) / puts["mid"].clip(1e-9)
 
-    # Liquidity + spread + delta band
     puts = puts[
         (puts["open_interest"] >= S.OI_MIN) &
         (puts["volume"] >= S.VOL_MIN) &
@@ -388,7 +441,8 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
     hist = tradier_history_daily(t, 420)
     if hist.empty: return
     spot = float(hist["Close"].iloc[-1])
-    atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
+    atr_series = atr(hist, S.ATR_LEN)
+    atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
     low  = float(hist["Low"].iloc[-1])
     trail = chandelier_bear(low, atr_val)
 
@@ -402,7 +456,7 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
         trail_bear = chandelier_bear(lowest, atr_val)
 
         reason = None
-        if spot > trail_bear: reason = "trail_bear_break"
+        if atr_val is not None and spot > trail_bear: reason = "trail_bear_break"
         elif mid <= peak*(1 - S.OPT_DD): reason = "drawdown"
         else:
             try: exp_dt = datetime.fromisoformat(p["expiry"])
@@ -420,12 +474,17 @@ def manage_open_for_ticker(t: str, cnt: Dict[str,int]):
 
 # --------------- Candidate processing ---------------
 def process_candidate_tradier(t: str, cnt: Dict[str,int]):
-    # confirm bearish with Tradier history as well (for ATR trail on entry)
+    # extra safety: don't buy if market closed
+    if not S.ALLOW_AFTER_HOURS and not market_open_rth():
+        if DEBUG: print(f"[SKIP] {t}: market not open for new buys")
+        return
+
     hist = tradier_history_daily(t, 420)
     if hist.empty:
         if DEBUG: print(f"[SKIP] {t}: no Tradier history"); return
     spot = float(hist["Close"].iloc[-1])
-    atr_val = float(atr(hist, S.ATR_LEN).iloc[-1])
+    atr_series = atr(hist, S.ATR_LEN)
+    atr_val = float(atr_series.dropna().iloc[-1]) if atr_series.notna().any() else None
     low  = float(hist["Low"].iloc[-1])
     trail_b = chandelier_bear(low, atr_val)
 
@@ -485,28 +544,32 @@ def run_once():
     syms = sp500_symbols()
     print(f"[INFO] Universe: S&P 500 symbols={len(syms)}")
 
-    # 2) bearish screen
-    candidates: List[str] = []
-    for i, sym in enumerate(syms, 1):
-        try:
-            if DEBUG and i % 50 == 1:
-                print(f"[PROGRESS] Screening {i}/{len(syms)}…")
-            if screen_symbol_bear(sym):
-                candidates.append(sym)
-        except Exception as e:
-            print(f"[ERR][screen] {sym}: {e}")
-
-    print(f"[INFO] Bearish candidates: {len(candidates)}")
-
-    # 3) options via Tradier only for candidates (throttled)
     cnt={"viable":0,"buys":0,"sells":0}
-    for t in candidates:
-        try:
-            process_candidate_tradier(t, cnt)
-        except Exception as e:
-            print(f"[ERR] {t}: {e}")
 
-    # 4) manage existing puts
+    # 2) bearish screen + buys only during RTH unless allowed
+    if not S.ALLOW_AFTER_HOURS and not market_open_rth():
+        print("[MARKET CLOSED] Skipping screening & new buys; will still manage open positions.")
+    else:
+        candidates: List[str] = []
+        for i, sym in enumerate(syms, 1):
+            try:
+                if DEBUG and i % 50 == 1:
+                    print(f"[PROGRESS] Screening {i}/{len(syms)}…")
+                if screen_symbol_bear(sym):
+                    candidates.append(sym)
+            except Exception as e:
+                print(f"[ERR][screen] {sym}: {e}")
+
+        print(f"[INFO] Bearish candidates: {len(candidates)}")
+
+        # 3) options via Tradier only for candidates (throttled)
+        for t in candidates:
+            try:
+                process_candidate_tradier(t, cnt)
+            except Exception as e:
+                print(f"[ERR] {t}: {e}")
+
+    # 4) manage existing puts (always)
     open_ticks = sorted(set([p["ticker"] for p in db_all() if p.get("option_type","put")=="put"]))
     for t in open_ticks:
         try:
@@ -514,7 +577,7 @@ def run_once():
         except Exception as e:
             print(f"[ERR][manage] {t}: {e}")
 
-    print(f"[SUMMARY] bear_candidates={len(candidates)} viable={cnt['viable']} buys={cnt['buys']} sells={cnt['sells']}")
+    print(f"[SUMMARY] bear_candidates={(cnt['viable']+0)} viable={cnt['viable']} buys={cnt['buys']} sells={cnt['sells']}")
 
 if __name__ == "__main__":
     run_once()
